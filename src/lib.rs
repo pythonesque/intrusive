@@ -1,62 +1,138 @@
+#![feature(associated_consts)]
+#![feature(const_fn, core_intrinsics)]
+#![feature(thread_local)]
 #![cfg_attr(test, feature(rustc_private))]
-use std::cell::UnsafeCell;
+#![feature(optin_builtin_traits)]
+use std::cell::{Cell, UnsafeCell};
+use std::intrinsics;
 use std::marker::PhantomData;
 use std::ops;
+
+struct GlobalLock(UnsafeCell<u8>);
+
+impl GlobalLock {
+    const fn new() -> Self {
+        GlobalLock(UnsafeCell::new(0))
+    }
+}
+
+unsafe impl Sync for GlobalLock {}
+
+static GLOBAL_LOCK: GlobalLock = GlobalLock::new();
+
+struct ThreadLock(Cell<u8>);
+
+impl ThreadLock {
+    const fn new() -> Self {
+        ThreadLock(Cell::new(0))
+    }
+}
+
+unsafe impl Sync for ThreadLock {}
+
+#[thread_local]
+static THREAD_LOCK: ThreadLock = ThreadLock::new();
 
 struct InvariantLifetime<'id>(
     PhantomData<*mut &'id ()>);
 
 impl<'id> InvariantLifetime<'id> {
     #[inline]
-    fn new() -> InvariantLifetime<'id> {
+    const fn new() -> InvariantLifetime<'id> {
         InvariantLifetime(PhantomData)
     }
 }
 
-pub struct Node<'id, T> {
-    inner_: UnsafeCell<T>,
-    _marker: InvariantLifetime<'id>,
+pub struct Node<T, S> {
+    inner: UnsafeCell<T>,
+    _marker: PhantomData<S>,
 }
 
-impl<'id, T> Node<'id, T> {
+pub struct GlobalGuard(());
+
+pub struct ThreadGuard(());
+
+impl !Send for ThreadGuard {}
+
+unsafe impl<T, S> Send for Node<T, S> where T: Send, S: Send {}
+unsafe impl<T, S> Sync for Node<T, S> where T: Sync, S: Sync {}
+
+impl<T, S> Node<T, S> {
     #[inline]
-    pub fn new(inner: T) -> Self {
+    pub const fn new(inner: T) -> Self {
         Node {
-            inner_: UnsafeCell::new(inner),
-            _marker: InvariantLifetime::new(),
+            inner: UnsafeCell::new(inner),
+            _marker: PhantomData,
         }
     }
 }
 
-pub type Link<'id, 'm, T> = &'m Node<'id, T>;
+pub type Link<'id, T, S> = &'id Node<T, S>;
 
-pub struct Root<'id>(InvariantLifetime<'id>);
+pub struct Root<S>(S);
 
-impl<'id> Root<'id> {
+impl<'id> Root<InvariantLifetime<'id>> {
     #[inline]
     pub fn with<F, T>(closure: F) -> T where
-            F: for<'a> FnOnce(Root<'a>) -> T
+            F: for<'a> FnOnce(Root<InvariantLifetime<'a>>) -> T
     {
         closure(Root(InvariantLifetime::new()))
     }
 }
 
-impl<'id, 'm, T> ops::Index<Link<'id, 'm, T>> for Root<'id> {
-    type Output = T;
-
-    #[inline]
-    fn index<'a>(&'a self, index: Link<'id, 'm, T>) -> &'a T {
+impl Root<GlobalGuard> {
+    pub fn global() -> Self {
         unsafe {
-            &*index.inner_.get()
+            if intrinsics::atomic_xchg_acq(GLOBAL_LOCK.0.get(), !0) != 0 {
+                intrinsics::abort();
+            }
+            Root(GlobalGuard(()))
         }
     }
 }
 
-impl<'id, 'm, T> ops::IndexMut<Link<'id, 'm, T>> for Root<'id> {
-    #[inline]
-    fn index_mut<'a>(&'a mut self, index: Link<'id, 'm, T>) -> &'a mut T {
+impl Drop for GlobalGuard {
+    fn drop(&mut self) {
         unsafe {
-            &mut *index.inner_.get()
+            intrinsics::atomic_store_rel(GLOBAL_LOCK.0.get(), 0);
+        }
+    }
+}
+
+impl Root<ThreadGuard> {
+    pub fn thread() -> Self {
+        if THREAD_LOCK.0.get() != 0 {
+            unsafe {
+                intrinsics::abort();
+            }
+        }
+        THREAD_LOCK.0.set(!0);
+        Root(ThreadGuard(()))
+    }
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        THREAD_LOCK.0.set(0);
+    }
+}
+
+impl<'id, T, S> ops::Index<Link<'id, T, S>> for Root<S> {
+    type Output = T;
+
+    #[inline]
+    fn index<'a>(&'a self, index: Link<'id, T, S>) -> &'a T {
+        unsafe {
+            &*index.inner.get()
+        }
+    }
+}
+
+impl<'id, T, S> ops::IndexMut<Link<'id, T, S>> for Root<S> {
+    #[inline]
+    fn index_mut<'a>(&'a mut self, index: Link<'id, T, S>) -> &'a mut T {
+        unsafe {
+            &mut *index.inner.get()
         }
     }
 }
@@ -65,17 +141,17 @@ impl<'id, 'm, T> ops::IndexMut<Link<'id, 'm, T>> for Root<'id> {
 mod tests {
     extern crate arena;
     use self::arena::TypedArena;
-    use {Link, Node, Root};
+    use {GlobalGuard, Link, Node, Root};
 
     #[test]
     fn it_works() {
-        struct Foo<'id, 'm, T> where T: 'm, 'id: 'm {
+        struct Foo<'id, T, S> where T: 'id, S: 'id {
             data: T,
-            link_a: Option<Link<'id, 'm, Foo<'id, 'm, T>>>,
-            link_b: Option<Link<'id, 'm, Foo<'id, 'm, T>>>,
+            link_a: Option<Link<'id, Foo<'id, T, S>, S>>,
+            link_b: Option<Link<'id, Foo<'id, T, S>, S>>,
         }
 
-        Root::with(|mut root| /*Root::with(|mut root_a| Root::with(|mut root_b|*/ {
+        Root::with(|mut root| {
             let mut data1 = 1u8;
             let mut data2 = 2u8;
             let mut data3 = 3u8;
@@ -106,7 +182,7 @@ mod tests {
             let next_b = root[&node3].link_b.unwrap();
             println!("node3 next_b: {:?}", root[next_b].data);
 
-        }/*))*/);
+        });
 
         Root::with(|mut root| {
             let mut data = 0u8;
@@ -114,9 +190,9 @@ mod tests {
             let mut data__ = 2u8;
             let (node, node_);
 
-            struct Bar<'id, 'm, T> where T: 'm, 'id: 'm {
+            struct Bar<'id, T, S> where T: 'id, S: 'id {
                 data: T,
-                next: Option<Link<'id, 'm, Bar<'id, 'm, T>>>,
+                next: Option<Link<'id, Bar<'id, T, S>, S>>,
             };
 
             node_ = Node::new(Bar { data: (1u8, Some(&mut data_)), next: None });
@@ -173,14 +249,14 @@ mod tests {
     fn union_find() {
         use std::cmp::Ordering;
 
-        struct Set<'id, 'm, T> where T: 'm, 'id: 'm {
+        struct Set<'id, T, S> where T: 'id, S: 'id {
             data: T,
-            parent: Option<Link<'id, 'm, Set<'id, 'm, T>>>,
+            parent: Option<Link<'id, Set<'id, T, S>, S>>,
             rank: u8,
         }
 
-        impl<'id, 'm, T> Set<'id, 'm, T> {
-            fn make(data: T) -> Self {
+        impl<'id, T, S> Set<'id, T, S> {
+            const fn make(data: T) -> Self {
                 Set {
                     data: data,
                     parent: None,
@@ -188,7 +264,7 @@ mod tests {
                 }
             }
 
-            fn find(root: &mut Root<'id>, x: Link<'id, 'm, Self>) -> Link<'id, 'm, Self> {
+            fn find(root: &mut Root<S>, x: Link<'id, Self, S>) -> Link<'id, Self, S> {
                 match root[x].parent {
                     Some(parent) => {
                         let parent = Set::find(root, parent);
@@ -199,7 +275,7 @@ mod tests {
                 }
             }
 
-            fn union(root: &mut Root<'id>, x: Link<'id, 'm, Self>, y: Link<'id, 'm, Self>) {
+            fn union(root: &mut Root<S>, x: Link<'id, Self, S>, y: Link<'id, Self, S>) {
                 let x_root = Set::find(root, x);
                 let y_root = Set::find(root, y);
                 
@@ -219,7 +295,6 @@ mod tests {
                 }
             }
         }
-
         Root::with(|mut root| {
             let arena = TypedArena::new();
 
@@ -239,12 +314,58 @@ mod tests {
             let z_ = Set::find(&mut root, z);
             root[y_].data.push_str("_append2");
             println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
+
             Set::union(&mut root, x, z);
             let x_ = Set::find(&mut root, x);
             let y_ = Set::find(&mut root, y);
             let z_ = Set::find(&mut root, z);
             root[z_].data.push_str("_append3");
             println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
+
+            type SSet = Node<Set<'static, &'static str, GlobalGuard>, GlobalGuard>;
+            static NODES: [SSet; 3] = [Node::new(Set::make("")), Node::new(Set::make("")), Node::new(Set::make(""))];
+
+            let w = {
+                let mut root = Root::global();
+
+                let x = &NODES[0];
+                let y = &NODES[1];
+                let z = &NODES[2];
+
+                root[x].data = "x";
+                root[y].data = "y";
+                root[z].data = "z";
+
+                let x_ = Set::find(&mut root, x);
+                let y_ = Set::find(&mut root, y);
+                let z_ = Set::find(&mut root, z);
+                println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
+
+                Set::union(&mut root, x, y);
+                let x_ = Set::find(&mut root, x);
+                let y_ = Set::find(&mut root, y);
+                let z_ = Set::find(&mut root, z);
+                println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
+
+                Set::union(&mut root, x, z);
+                let x_ = Set::find(&mut root, x);
+                let y_ = Set::find(&mut root, y);
+                let z_ = Set::find(&mut root, z);
+                println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
+
+                //let (w, v);
+                let w = Node::new(Set::make(""));
+                //v = Node::new(Set::make(""));
+                root[&w].parent = Some(y);
+                //root[&v].parent = Some(&w);
+                println!("{:?}", root[&w].data);
+                w
+            };
+            let mut root = Root::global();
+
+            root[&w].data = "3";
+
+            println!("{:?}", root[&w].data);
         });
     }
 }
