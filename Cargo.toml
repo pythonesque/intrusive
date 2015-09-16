@@ -1,0 +1,4 @@
+[package]
+name = "intrusive"
+version = "0.1.0"
+authors = ["Joshua Yanovski <pythonesque@gmail.com>"]
