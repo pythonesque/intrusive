@@ -1,7 +1,7 @@
 #![feature(associated_consts)]
 #![feature(const_fn, core_intrinsics)]
 #![feature(thread_local)]
-//#![cfg_attr(test, feature(rustc_private))]
+#![cfg_attr(test, feature(rustc_private))]
 #![feature(optin_builtin_traits)]
 
 use std::cell::{Cell, UnsafeCell};
