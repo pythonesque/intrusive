@@ -1,12 +1,19 @@
 #![feature(associated_consts)]
 #![feature(const_fn, core_intrinsics)]
 #![feature(thread_local)]
-#![cfg_attr(test, feature(rustc_private))]
+//#![cfg_attr(test, feature(rustc_private))]
 #![feature(optin_builtin_traits)]
+
 use std::cell::{Cell, UnsafeCell};
 use std::intrinsics;
 use std::marker::PhantomData;
 use std::ops;
+
+//pub mod dlist;
+pub mod safe_dlist;
+//mod hlist;
+//mod graph;
+//mod tree;
 
 struct GlobalLock(UnsafeCell<u8>);
 
@@ -43,7 +50,7 @@ impl<'id> InvariantLifetime<'id> {
     }
 }
 
-pub struct Node<T, S> {
+pub struct Base<T, S> {
     inner: UnsafeCell<T>,
     _marker: PhantomData<S>,
 }
@@ -54,20 +61,47 @@ pub struct ThreadGuard(());
 
 impl !Send for ThreadGuard {}
 
-unsafe impl<T, S> Send for Node<T, S> where T: Send, S: Send {}
-unsafe impl<T, S> Sync for Node<T, S> where T: Sync, S: Sync {}
+unsafe impl<T, S> Send for Base<T, S> where T: Send, S: Send {}
+unsafe impl<T, S> Sync for Base<T, S> where T: Sync, S: Sync {}
 
-impl<T, S> Node<T, S> {
+impl<T, S> Base<T, S> {
     #[inline]
     pub const fn new(inner: T) -> Self {
-        Node {
+        Base {
             inner: UnsafeCell::new(inner),
             _marker: PhantomData,
         }
     }
 }
 
-pub type Link<'id, T, S> = &'id Node<T, S>;
+impl<T, U, S> ops::Deref for Base<(Base<T, S>, U), S> {
+    type Target = Base<T, S>;
+
+    #[inline]
+    fn deref<'id>(&'id self) -> &'id Base<T, S> {
+        unsafe {
+            //let (ref first, ref second) = *index.inner.get();
+            //(first, second)
+            //let (ref first, _) = *index.inner.get();
+            &(&*self.inner.get()).0
+        }
+    }
+}
+
+pub type Link<'id, T, S> = &'id Base<T, S>;
+
+/*impl<T, U, S> Base<(Base<T, S>, U), S> {
+    #[inline]
+    pub fn upcast<'id>(&'id self) -> Link<'id, T, S>
+    {
+        unsafe {
+            //let (ref first, ref second) = *index.inner.get();
+            //(first, second)
+            //let (ref first, _) = *index.inner.get();
+            &(&*self.inner.get()).0
+        }
+    }
+}*/
 
 pub struct Root<S>(S);
 
@@ -137,11 +171,58 @@ impl<'id, T, S> ops::IndexMut<Link<'id, T, S>> for Root<S> {
     }
 }
 
+/*impl<S> Root<S> {
+    /*#[inline]
+    pub fn split_at<'a, 'id, T, U>(&'a self, index: Link<'id, (Base<T, S>, U), S>) -> (Link<'id, T, S>, &'a U) //where
+            //T: 'id,
+            //T: 'a,
+            //U: 'id,
+            //V: 'id,
+            //'id: 'a,
+            //'a: 'id,
+            //U: 'a,
+            //'a: 'id,
+    {
+        unsafe {
+            let (ref first, ref second) = *index.inner.get();
+            (first, second)
+        }
+    }*/
+
+    #[inline]
+    pub fn upcast<'a, 'id, T, U>(&'a self, index: Link<'id, (Base<T, S>, U), S>) -> Link<'id, T, S>
+    {
+        unsafe {
+            //let (ref first, ref second) = *index.inner.get();
+            //(first, second)
+            //let (ref first, _) = *index.inner.get();
+            &(&*index.inner.get()).0
+        }
+    }
+
+    /*#[inline]
+    pub fn split_at_mut<'a, 'id, T, U>(&'a self, index: Link<'id, (Base<T, S>, U), S>) -> (Link<'id, T, S>, &'a mut U) //where
+            //T: 'id,
+            //T: 'a,
+            //U: 'id,
+            //V: 'id,
+            //'id: 'a,
+            //'a: 'id,
+            //U: 'a,
+            //'a: 'id,
+    {
+        unsafe {
+            let (ref mut first, ref mut second) = *index.inner.get();
+            (first, second)
+        }
+    }*/
+}*/
+
 #[cfg(test)]
 mod tests {
     extern crate arena;
     use self::arena::TypedArena;
-    use {GlobalGuard, Link, Node, Root};
+    use {GlobalGuard, Link, Base, Root};
 
     #[test]
     fn it_works() {
@@ -158,9 +239,9 @@ mod tests {
 
             let (node1, node2, node3);
 
-            node2 = Node::new(Foo { data: (2u8, Some(&mut data2)), link_a: None, link_b: None });
-            node3 = Node::new(Foo { data: (3u8, Some(&mut data3)), link_a: None, link_b: Some(&node2) });
-            node1 = Node::new(Foo { data: (1u8, Some(&mut data1)), link_a: Some(&node2), link_b: Some(&node3) });
+            node2 = Base::new(Foo { data: (2u8, Some(&mut data2)), link_a: None, link_b: None });
+            node3 = Base::new(Foo { data: (3u8, Some(&mut data3)), link_a: None, link_b: Some(&node2) });
+            node1 = Base::new(Foo { data: (1u8, Some(&mut data1)), link_a: Some(&node2), link_b: Some(&node3) });
 
             root[&node2].link_a = Some(&node3);
             root[&node2].link_b = Some(&node1);
@@ -195,8 +276,8 @@ mod tests {
                 next: Option<Link<'id, Bar<'id, T, S>, S>>,
             };
 
-            node_ = Node::new(Bar { data: (1u8, Some(&mut data_)), next: None });
-            node = Node::new(Bar { data: (0u8, Some(&mut data)), next: Some(&node_)});
+            node_ = Base::new(Bar { data: (1u8, Some(&mut data_)), next: None });
+            node = Base::new(Bar { data: (0u8, Some(&mut data)), next: Some(&node_)});
 
             root[&node_].next = Some(&node);
 
@@ -213,7 +294,7 @@ mod tests {
 
             {
                 //let data__ = root[&node].data.0;
-                let node_ = Node::new(Bar {
+                let node_ = Base::new(Bar {
                     data: (1u8, Some(&mut data__)),
                     next: None
                 });
@@ -298,9 +379,9 @@ mod tests {
         Root::with(|mut root| {
             let arena = TypedArena::new();
 
-            let x = arena.alloc(Node::new(Set::make("x".to_string())));
-            let y = arena.alloc(Node::new(Set::make("y".into())));
-            let z = arena.alloc(Node::new(Set::make("z".into())));
+            let x = arena.alloc(Base::new(Set::make("x".to_string())));
+            let y = arena.alloc(Base::new(Set::make("y".into())));
+            let z = arena.alloc(Base::new(Set::make("z".into())));
 
             let x_ = Set::find(&mut root, x);
             let y_ = Set::find(&mut root, y);
@@ -322,8 +403,8 @@ mod tests {
             root[z_].data.push_str("_append3");
             println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
 
-            type SSet = Node<Set<'static, &'static str, GlobalGuard>, GlobalGuard>;
-            static NODES: [SSet; 3] = [Node::new(Set::make("")), Node::new(Set::make("")), Node::new(Set::make(""))];
+            type SSet = Base<Set<'static, &'static str, GlobalGuard>, GlobalGuard>;
+            static NODES: [SSet; 3] = [Base::new(Set::make("")), Base::new(Set::make("")), Base::new(Set::make(""))];
 
             let w = {
                 let mut root = Root::global();
@@ -354,8 +435,8 @@ mod tests {
                 println!("x: {:?} y: {:?}, z: {:?}", root[x_].data, root[y_].data, root[z_].data);
 
                 //let (w, v);
-                let w = Node::new(Set::make(""));
-                //v = Node::new(Set::make(""));
+                let w = Base::new(Set::make(""));
+                //v = Base::new(Set::make(""));
                 root[&w].parent = Some(y);
                 //root[&v].parent = Some(&w);
                 println!("{:?}", root[&w].data);
